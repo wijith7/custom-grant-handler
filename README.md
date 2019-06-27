@@ -1,5 +1,5 @@
-# wso2-sample-claim-handler
-## To return groupid in OIDC id_token,
+# wso2-custom-grant-handler
+## To return groupid in JWT Access_token,
 
 1. Build with mvn clean install
 2. Paste the jar to <IS_HOME>/repository/component/dropins directory
