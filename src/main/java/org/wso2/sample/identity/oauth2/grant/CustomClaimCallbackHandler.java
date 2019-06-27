@@ -23,11 +23,14 @@ import org.apache.commons.lang.StringUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.wso2.carbon.identity.application.authentication.framework.exception.FrameworkException;
+import org.wso2.carbon.identity.application.authentication.framework.model.AuthenticatedUser;
 import org.wso2.carbon.identity.application.authentication.framework.util.FrameworkUtils;
 import org.wso2.carbon.identity.application.common.IdentityApplicationManagementException;
 import org.wso2.carbon.identity.application.common.model.ClaimMapping;
 import org.wso2.carbon.identity.application.common.model.ServiceProvider;
 import org.wso2.carbon.identity.application.mgt.ApplicationManagementService;
+import org.wso2.carbon.identity.base.IdentityException;
+import org.wso2.carbon.identity.core.util.IdentityTenantUtil;
 import org.wso2.carbon.identity.oauth2.internal.OAuth2ServiceComponentHolder;
 import org.wso2.carbon.identity.oauth2.token.OAuthTokenReqMessageContext;
 import org.wso2.carbon.identity.openidconnect.DefaultOIDCClaimsCallbackHandler;
@@ -36,13 +39,17 @@ import org.wso2.carbon.user.api.UserRealm;
 import org.wso2.carbon.user.api.UserStoreException;
 import org.wso2.carbon.user.core.UserStoreManager;
 import org.wso2.carbon.user.core.service.RealmService;
+import org.wso2.carbon.utils.multitenancy.MultitenantUtils;
 import org.wso2.sample.identity.oauth2.grant.dao.CustomClaimHandlerDAO;
 import org.wso2.sample.identity.oauth2.grant.internal.CustomClaimHandlerDataHolder;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Pattern;
 
+import static org.wso2.carbon.identity.application.authentication.framework.util.FrameworkConstants.LOCAL_ROLE_CLAIM_URI;
 import static org.wso2.carbon.identity.core.util.IdentityTenantUtil.getTenantId;
 
 /**
@@ -53,8 +60,6 @@ public class CustomClaimCallbackHandler extends DefaultOIDCClaimsCallbackHandler
     private static Log log = LogFactory.getLog(CustomClaimCallbackHandler.class);
 
     private final static String OAUTH2 = "oauth2";
-    private final static String OIDC_DIALECT = "http://wso2.org/oidc/claim";
-    private final static String ATTRIBUTE_SEPARATOR = FrameworkUtils.getMultiAttributeSeparator();
 
     @Override
     public JWTClaimsSet handleCustomClaims(JWTClaimsSet.Builder jwtClaimsSetBuilder, OAuthTokenReqMessageContext
@@ -62,12 +67,18 @@ public class CustomClaimCallbackHandler extends DefaultOIDCClaimsCallbackHandler
 
         JWTClaimsSet jwtClaimsSet = super.handleCustomClaims(jwtClaimsSetBuilder, tokenReqMessageContext);
 
-        List<String> rolesList = (List<String>) jwtClaimsSet.getClaims().get("groups");
-        List<String> refinedRolesList = getRefinedRolesList(tokenReqMessageContext, rolesList);
-        String attributeSeparator = ",";
-
+        AuthenticatedUser authenticatedUser = tokenReqMessageContext.getAuthorizedUser();
+        String fullQualifiedUsername = authenticatedUser.toFullQualifiedUsername();
         String spTenantDomain = tokenReqMessageContext.getOauth2AccessTokenReqDTO().getTenantDomain();
         String clientId = tokenReqMessageContext.getOauth2AccessTokenReqDTO().getClientId();
+        String userTenantDomain = tokenReqMessageContext.getAuthorizedUser().getTenantDomain();
+
+        UserRealm realm = null;
+        try {
+            realm = IdentityTenantUtil.getRealm(userTenantDomain, fullQualifiedUsername);
+        } catch (IdentityException e) {
+            log.error("Error while retrieving realm ", e);
+        }
 
         ServiceProvider serviceProvider = null;
         try {
@@ -75,8 +86,24 @@ public class CustomClaimCallbackHandler extends DefaultOIDCClaimsCallbackHandler
         } catch (IdentityApplicationManagementException e) {
             log.error("Error while retrieving serviceProvider for requestedClaimMappings in " + clientId, e);
         }
-
         ClaimMapping[] requestedClaimMappings = getRequestedClaimMappings(serviceProvider);
+
+        List<String> requestedClaimUris = getRequestedClaimUris(requestedClaimMappings);
+
+        Map<String, String> userClaims = null;
+        try {
+            userClaims = getUserClaimsInLocalDialect(fullQualifiedUsername, realm, requestedClaimUris);
+        } catch (FrameworkException e) {
+            log.error("Error while retrieving userClaims ", e);
+        } catch (UserStoreException e) {
+            log.error("Error while retrieving userClaims ", e);
+        }
+
+        String attributeSeparator = FrameworkUtils.getMultiAttributeSeparator();
+        String roleClaim = userClaims.get(LOCAL_ROLE_CLAIM_URI);
+        List<String> rolesList = Arrays.asList(roleClaim.split(Pattern.quote(attributeSeparator)));
+
+        List<String> refinedRolesList = getRefinedRolesList(tokenReqMessageContext, rolesList);
 
         boolean hasClaim = false;
 
@@ -95,12 +122,9 @@ public class CustomClaimCallbackHandler extends DefaultOIDCClaimsCallbackHandler
             return jwtClaimsSet;
         }
 
-        if (jwtClaimsSet.getClaims().get("groups") == null) {
+        if (rolesList == null) {
             return jwtClaimsSet;
         }
-
-        String userTenantDomain = tokenReqMessageContext.getAuthorizedUser().getTenantDomain();
-        tokenReqMessageContext.getTenantID();
 
         boolean isSCIMEnabled;
 
@@ -110,8 +134,6 @@ public class CustomClaimCallbackHandler extends DefaultOIDCClaimsCallbackHandler
         if (!isSCIMEnabled) {
             return jwtClaimsSet;
         }
-
-        JWTClaimsSet.Builder newBuilder = new JWTClaimsSet.Builder(jwtClaimsSet);
 
         try {
             jwtClaimsSetBuilder.claim("group_id", getGroupId(tokenReqMessageContext, refinedRolesList,
@@ -221,6 +243,28 @@ public class CustomClaimCallbackHandler extends DefaultOIDCClaimsCallbackHandler
             return new ClaimMapping[0];
         }
         return serviceProvider.getClaimConfig().getClaimMappings();
+    }
+
+    private List<String> getRequestedClaimUris(ClaimMapping[] requestedLocalClaimMap) {
+
+        List<String> claimURIList = new ArrayList<>();
+        for (ClaimMapping mapping : requestedLocalClaimMap) {
+            if (mapping.isRequested()) {
+                claimURIList.add(mapping.getLocalClaim().getClaimUri());
+            }
+        }
+        return claimURIList;
+    }
+
+    private Map<String, String> getUserClaimsInLocalDialect(String username, UserRealm realm,
+                                                            List<String> claimURIList) throws FrameworkException,
+            UserStoreException {
+
+        return realm.getUserStoreManager()
+                .getUserClaimValues(
+                        MultitenantUtils.getTenantAwareUsername(username),
+                        claimURIList.toArray(new String[claimURIList.size()]),
+                        null);
     }
 
 }
